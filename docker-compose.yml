@@ -1,0 +1,108 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mini_leetcode_mysql
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --max-connections=500
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: mini_leetcode
+      MYSQL_USER: leetcode
+      MYSQL_PASSWORD: leetcode_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - mini_leetcode_net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "leetcode", "-pleetcode_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1536M
+        reservations:
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    container_name: mini_leetcode_redis
+    restart: unless-stopped
+    command: >
+      redis-server 
+      --appendonly yes 
+      --requirepass redis_password 
+      --maxmemory 512mb 
+      --maxmemory-policy noeviction
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - mini_leetcode_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_password", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  minio:
+    image: elestio/minio:latest
+    container_name: mini_leetcode_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadminpassword
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - mini_leetcode_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1024M
+
+  # Provisioner container to automatically bootstrap buckets and policies
+  minio_provisioner:
+    image: elestio/minio:latest
+    container_name: mini_leetcode_minio_provisioner
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - mini_leetcode_net
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadminpassword;
+      mc mb --ignore-existing local/testcases;
+      mc mb --ignore-existing local/submissions;
+      exit 0;
+      "
+
+networks:
+  mini_leetcode_net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
+  minio_data:

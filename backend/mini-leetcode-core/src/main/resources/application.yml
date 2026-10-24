@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: mini_leetcode
+  profiles:
+    active: local
+  jpa:
+    open-in-view: false
+  data:
+    web:
+      pageable:
+        max-page-size: 100
+        default-page-size: 20
+
+app:
+  jwt:
+    secret: ${JWT_SECRET:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}
+    access-token-expiration-ms: 1800000 # 30 minutes
+    refresh-token-expiration-ms: 604800000 # 7 days
+  minio:
+    url: ${MINIO_URL:http://localhost:9000}
+    access-key: ${MINIO_ACCESS_KEY:minioadmin}
+    secret-key: ${MINIO_SECRET_KEY:minioadminpassword}
+    bucket-name: ${MINIO_BUCKET_NAME:testcases}
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:redis_password}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized

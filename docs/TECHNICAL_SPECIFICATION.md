@@ -8,11 +8,10 @@
 
 ## 1. TỔNG QUAN KIẾN TRÚC & NGUYÊN TẮC THIẾT KẾ (ARCHITECTURE PRINCIPLES)
 
-Nhằm khắc phục toàn diện các điểm yếu về bảo mật máy chủ, độ nghẽn I/O và sự cố mất dữ liệu hàng đợi, kiến trúc Mini LeetCode được thiết kế dựa trên 4 trụ cột:
-1. **Triệt tiêu nguy cơ chiếm quyền Host (Zero Host Takeover Risk):** Tách biệt tuyệt đối giữa Web API hướng người dùng (Public Facing) và Judge Worker thực thi Sandbox. Web API **hoàn toàn không được mount `/var/run/docker.sock`**. Worker chạy cô lập với quyền hạn tối thiểu.
-2. **Hàng đợi chống mất mát dữ liệu (Reliable Queue via Redis Streams / Dead-Letter):** Sử dụng Redis Streams (`XADD`, `XREADGROUP`, `XACK`) với Consumer Groups và cơ chế tái xử lý Pending Entries List (PEL), loại bỏ hoàn toàn hiện tượng "Zombie Jobs" khi Worker khởi động lại.
-3. **Thực thi Sandbox Hiệu năng cao (Warm Container / Pool Runner Pattern):** Tối ưu hóa I/O, sử dụng cơ chế chia sẻ volume an toàn hoặc runner process tối ưu, triệt tiêu độ trễ khởi tạo `docker run` liên tục gây sập Docker Daemon.
-4. **Cơ chế Testcase I/O Streaming:** Dữ liệu testcase lớn (từ vài MB đến vài chục MB) được lưu trữ dạng File Storage (Local/MinIO/S3), truyền vào Sandbox qua cơ chế File Streaming, không bao giờ load toàn bộ vào MySQL hoặc Heap Memory của Backend.
+Nhằm khắc phục toàn diện các điểm yếu về bảo mật máy chủ, độ nghẽn I/O và phù hợp với quy mô đồ án sinh viên (Pragmatic Architecture), kiến trúc Mini LeetCode phân định rõ 3 Role chuyên trách trong luồng Sandbox:
+1. **Role 1 - Web API Gateway (`mini-leetcode-api`):** Tiếp nhận bài nộp, xác thực JWT, lưu metadata trạng thái `PENDING`, đẩy message vào Redis Queue. Web API **tuyệt đối không được mount `/var/run/docker.sock`**, triệt tiêu 100% nguy cơ chiếm quyền Host.
+2. **Role 2 - Judge Worker (`mini-leetcode-judge`):** Dịch vụ chạy nền độc lập, tiêu thụ job từ Redis Queue (`BLPOP` / `XREAD`), tải testcases về thư mục tạm cục bộ, điều phối và giám sát vòng đời của Sandbox Runner qua Docker CLI, thu thập số liệu CPU/RAM và tính toán Verdict (`AC`, `WA`, `TLE`, `MLE`, `RE`, `CE`).
+3. **Role 3 - Ephemeral Sandbox Runner (Docker Containerized):** Môi trường thực thi mã nguồn dùng 1 lần (Ephemeral Container) được cách ly tuyệt đối với các cờ: `--network none` (ngắt mạng), `--memory 256m` (giới hạn RAM), `--cpus 1` (giới hạn CPU), `--pids-limit 64` (chống Fork Bomb), mount thư mục testcase ở chế độ Read-Only (`-v ...:/workspace:ro`). Hỗ trợ **Java 17 LTS** và **Python 3**. Áp dụng chính sách Fail-Fast (dừng ngay ở testcase lỗi đầu tiên).
 
 ```mermaid
 flowchart TD
@@ -29,53 +28,61 @@ flowchart TD
 
     subgraph StorageInfra ["Data & Queue Tier"]
         MySQL[("MySQL 8.0 Primary DB")]
-        RedisStreams[("Redis Streams: Submissions & Events")]
-        FileStorage[("Testcase Storage (Filesystem / S3 Object)")]
+        RedisQueue[("Redis Queue: queue.submissions")]
+        FileStorage[("Testcase Storage (MinIO / S3 Object)")]
     end
 
-    subgraph JudgeTier ["Isolated Judge Tier (Specialized Host / Container)"]
-        WorkerService["Judge Worker (Consumer Group)"]
-        SandboxManager["Sandbox Manager (Warm Pool / Cgroups / Isolate)"]
-        Sandboxes["Ephemeral Exec Sandboxes (--net none, non-root)"]
+    subgraph JudgeTier ["Judge & Execution Tier"]
+        WorkerService["Role 2: Judge Worker (mini-leetcode-judge)"]
+        LocalStaging["Local Temp Staging (temp-submissions/{id})"]
+        Runner["Role 3: Ephemeral Sandbox Runner (Java 17 / Python 3)\n(--net none, --memory 256m, --pids-limit 64)"]
     end
 
     Browser -->|1. Submit Code| PublicAPI
     Watcher -->|2. Heartbeat Ping / Window Events| HeartbeatService
     HeartbeatService -->|Update State| MySQL
 
-    PublicAPI -->|3. Save Submission Metadata| MySQL
-    PublicAPI -->|4. XADD queue.submissions| RedisStreams
+    PublicAPI -->|3. Save Submission (PENDING)| MySQL
+    PublicAPI -->|4. RPUSH queue.submissions| RedisQueue
     
-    WorkerService -->|5. XREADGROUP (Auto Claim PEL)| RedisStreams
-    WorkerService -->|6. Stream Testcase Input| FileStorage
-    WorkerService -->|7. Exec in Isolated Environment| SandboxManager
-    SandboxManager --> Sandboxes
-    Sandboxes -->|8. Raw Output, Metrics, ExitCode| SandboxManager
+    WorkerService -->|5. BLPOP queue.submissions| RedisQueue
+    WorkerService -->|6. Fetch Testcase Files| FileStorage
+    WorkerService -->|7. Prepare Input Files (ro mount)| LocalStaging
+    LocalStaging -->|8. Mount -v ...:/workspace:ro| Runner
+    Runner -->|9. Raw Output, Metrics, ExitCode (Fail-Fast)| WorkerService
     
-    WorkerService -->|9. Update Verdict, Runtime, Peak RAM| MySQL
-    WorkerService -->|10. XACK & Cache Result| RedisStreams
+    WorkerService -->|10. Update Verdict, Runtime, RAM| MySQL
+    WorkerService -->|11. Cache Fast Result| RedisQueue
 
-    Browser -->|11. Exponential Backoff Polling| PublicAPI
-    PublicAPI -->|12. Fast Cache Read| RedisStreams
+    Browser -->|12. Polling Submission Status| PublicAPI
+    PublicAPI -->|13. Fast Cache Read| RedisQueue
 ```
 
 ---
 
-## 2. GIẢI QUYẾT TRIỆT ĐỂ CÁC VẤN ĐỀ BẢO MẬT & KIẾN TRÚC
+## 2. PHÂN CHIA ROLE & AN NINH SANDBOX (PRAGMATIC ROLE SEPARATION)
 
-### 2.1 An ninh Sandbox: Loại bỏ nguy cơ Root Takeover qua Docker Socket
+### 2.1 Bảng phân định 3 Role chuyên trách trong hệ thống Sandbox
 
-- **Vấn đề đã nhận diện:** Mount trực tiếp `/var/run/docker.sock` vào Web API container khiến ứng dụng nếu dính lỗ hổng bảo mật (như SQL Injection, Deserialization, RCE) sẽ bị hacker lợi dụng Docker API để leo quyền kiểm soát toàn bộ máy chủ host.
-- **Giải pháp kiến trúc chuẩn:**
-  1. **Tách biệt hoàn toàn (Physical / Service Segregation):**
-     - Container `web-api` chỉ kết nối với MySQL và Redis. **Không có bất kỳ quyền hạn hay file socket nào liên quan đến Docker.**
-     - Tiến trình `judge-worker` được tách thành một dịch vụ riêng biệt. Nếu triển khai trên cùng máy chủ vật lý, chỉ có `judge-worker` mới được cấu hình socket chạy quyền hạn riêng (sử dụng Docker Rootless mode hoặc Linux Sandbox độc lập như `nsjail`/`isolate`).
-  2. **Cấu hình Sandbox Runner tối hậu:**
-     - Mạng: `--network none` (Cô lập 100% mạng).
-     - Bộ nhớ: `--memory 256m --memory-swap 256m` (Triệt tiêu Swap, cưỡng chế ngắt OOM để bắt mã phán quyết `MLE`).
-     - Tiến trình: `--pids-limit 64` (Ngăn chặn hoàn toàn Fork Bomb).
-     - Quyền hạn: `--cap-drop ALL`, chạy dưới User ID không đặc quyền `1001:1001`.
-     - File system: `--read-only`, chỉ mount thư mục làm việc dạng Read-Only, vùng ghi tạm nằm trên RAM (`--tmpfs /tmp:rw,noexec,nosuid,size=32m`).
+| Tiêu chí | Role 1: Web API Gateway (`api`) | Role 2: Judge Worker (`judge`) | Role 3: Ephemeral Sandbox Runner |
+| :--- | :--- | :--- | :--- |
+| **Bản chất** | REST API Service (Public facing) | Background Consumer Service (Internal) | Docker Container tạm thời (chạy xong hủy) |
+| **Quyền hạn Docker** | **TUYỆT ĐỐI KHÔNG** có quyền Docker socket | Có quyền gọi Docker CLI / Docker API | Chạy dưới user không đặc quyền (`non-root`) |
+| **Môi trường kết nối** | HTTP(S) Public, MySQL, Redis | Redis Queue, MySQL, MinIO, Docker Engine | Mạng bị cô lập hoàn toàn (`--network none`) |
+| **Trách nhiệm chính** | Nhận code, kiểm tra payload, lưu trạng thái `PENDING`, trả response tức thì | Lấy job từ queue, tải testcase, điều phối runner, tổng hợp Verdict, cập nhật DB | Biên dịch và chạy code người dùng với input, xuất kết quả qua stdout/file |
+| **Chế độ bảo vệ** | Rate Limiting, JWT Guard | Xử lý timeout (`Process.waitFor`), dọn file tạm | Giới hạn RAM (`256m`), CPU (`1 core`), PIDs (`64`) |
+
+### 2.2 An ninh Sandbox: Loại bỏ nguy cơ Root Takeover và Khai thác Host
+
+1. **Ranh giới cô lập (Isolation Boundary):**
+   - Container `web-api` chỉ kết nối với MySQL và Redis. **Không có bất kỳ quyền hạn hay file socket nào liên quan đến Docker.** Nếu hacker tìm được lỗ hổng ở API, chúng không thể thao túng Docker host.
+   - Chỉ có tiến trình `mini-leetcode-judge` mới giao tiếp với Docker Daemon qua socket nội bộ.
+2. **Cấu hình Sandbox Runner tinh gọn & an toàn:**
+   - **Mạng:** `--network none` (Cô lập 100% mạng, chặn truy cập ra ngoài hoặc vào các service nội bộ).
+   - **Bộ nhớ:** `--memory 256m --memory-swap 256m` (Triệt tiêu Swap, cưỡng chế ngắt khi vượt ngưỡng để bắt mã `MLE`).
+   - **Tiến trình:** `--pids-limit 64` (Ngăn chặn hoàn toàn Fork Bomb).
+   - **File System:** Mount thư mục làm việc ở chế độ Read-Only (`-v ...:/workspace:ro`), vùng ghi tạm nằm trên RAM (`--tmpfs /tmp:rw,noexec,nosuid,size=32m`).
+   - **Thời gian chạy:** Worker kiểm soát thời gian bằng `Process.waitFor(timeLimitMs, TimeUnit.MILLISECONDS)` để bắt mã `TLE`.
 
 ### 2.2 Xử lý Mã Độc: Loại bỏ Static Regex Blacklist
 
@@ -105,47 +112,49 @@ flowchart TD
 
 ---
 
-### 2.4 Hàng đợi Bền vững: Khắc phục sự cố Zombie Jobs qua Redis Streams
+### 2.4 Hàng đợi Bền vững & Phân tách Xử lý (Queue & Dispatching Lifecycle)
 
-- **Vấn đề đã nhận diện:** Sử dụng `BRPOPLPUSH` kết hợp lệnh $O(N)$ `LREM` dễ làm mất bài nộp khi Worker bị sập đột ngột (Zombie Jobs kẹt vĩnh viễn ở trạng thái `JUDGING`).
-- **Giải pháp kiến trúc chuẩn: Redis Streams + Consumer Groups:**
+- **Triển khai Pragmatic:** Sử dụng **Redis Queue tinh gọn** (`RPUSH queue.submissions` từ Web API và `BLPOP queue.submissions 5` từ Judge Worker).
+  - Web API không bị nghẽn (Non-blocking I/O), ngay lập tức trả về mã `202 ACCEPTED` kèm `submissionId`.
+  - Judge Worker tiêu thụ tuần tự hoặc đa luồng độc lập, cập nhật trạng thái `JUDGING`.
+- **Định hướng mở rộng Enterprise (Future Production Roadmap):** Có thể nâng cấp lên Redis Streams Consumer Groups kèm cơ chế thu hồi job bị kẹt (XPENDING/XCLAIM) khi mở rộng cụm worker phân tán nhiều máy chủ.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant API as Web API
-    participant RS as Redis Stream (queue.submissions)
-    participant W as Judge Worker
+    participant API as Role 1: Web API
+    participant RQ as Redis Queue (queue.submissions)
+    participant W as Role 2: Judge Worker
+    participant R as Role 3: Sandbox Runner
     participant DB as MySQL DB
 
-    API->>RS: 1. XADD queue.submissions * submissionId 5012
-    W->>RS: 2. XREADGROUP GROUP judge-group worker-1 STREAMS queue.submissions >
-    Note over RS, W: Tin nhắn vào Pending Entries List (PEL) của worker-1
-    W->>DB: 3. UPDATE status='JUDGING'
+    API->>RQ: 1. RPUSH queue.submissions (submissionId: 5012)
+    API->>DB: 2. INSERT submission (status='PENDING')
+    W->>RQ: 3. BLPOP queue.submissions (Timeout: 5s)
+    W->>DB: 4. UPDATE status='JUDGING'
+    W->>W: 5. Chuẩn bị thư mục temp-submissions/5012/ (Code + Inputs)
     
-    alt Thực thi thành công
-        W->>W: Chạy Sandbox & Tính toán Verdict
-        W->>DB: 4. UPDATE status='COMPLETED', verdict='AC'
-        W->>RS: 5. XACK queue.submissions judge-group <message_id>
-    else Worker bị Crash giữa chừng (Zombie Job Detection)
-        Note over W: Worker chết trước khi kịp XACK
-        participant W2 as Active Worker / Janitor
-        W2->>RS: 6. XPENDING queue.submissions judge-group (Kiểm tra tin nhắn kẹt > 30s)
-        W2->>RS: 7. XCLAIM queue.submissions judge-group worker-2 30000 <message_id>
-        W2->>DB: 8. Tái xử lý hoặc đánh dấu FAILED nếu retry > 3 lần
+    W->>R: 6. docker run --rm --net none -v ...:/workspace:ro (Java 17 / Python 3)
+    alt Chạy thành công qua toàn bộ testcases
+        R-->>W: 7. Output hợp lệ (stdout, runtime, peak RAM)
+        W->>DB: 8. UPDATE status='COMPLETED', verdict='ACCEPTED'
+    else Gặp testcase lỗi đầu tiên (Fail-Fast)
+        R-->>W: 7. TLE / WA / MLE / RE tại testcase #i
+        W->>DB: 8. UPDATE status='COMPLETED', verdict='WRONG_ANSWER' / 'TLE'...
     end
+    W->>RQ: 9. SET cache:submission:5012 (Fast Poll Cache)
+    W->>W: 10. Xóa thư mục tạm temp-submissions/5012/
 ```
 
 ---
 
 ### 2.5 Hiệu năng & Quy mô (Performance & Scalability Optimization)
 
-#### 1. Cơ chế Chấm Code Hiệu năng cao (Khắc phục Docker Spawn Overhead):
-- Thay vì `docker run` (tạo mới và hủy container cho từng testcase đơn lẻ gây sập Daemon khi có hàng trăm lượt submit đồng thời):
-  - **Mỗi lượt nộp bài chỉ chạy đúng 1 Container Ephemeral duy nhất cho toàn bộ bộ test:**
-    - Worker mount thư mục chứa mã nguồn và danh sách testcase (chế độ Read-Only).
-    - Bên trong container, một runner tiến trình tối giản (viết bằng C hoặc Python nhúng) đọc qua từng testcase, đo đạc thời gian CPU và bộ nhớ bằng system calls nội tại.
-    - Container kết thúc và hủy trong 1 lần duy nhất sau khi chạy xong toàn bộ testcases (hoặc dừng sớm ngay khi gặp testcase đầu tiên bị sai / TLE).
+#### 1. Cơ chế Chấm Code Tinh gọn (1 Container Ephemeral duy nhất / Bài nộp):
+- **Tránh Docker Spawn Overhead:**
+  - Mỗi lượt nộp bài chỉ khởi tạo đúng **1 Container Ephemeral duy nhất** (`mini-leetcode-runner:1.0`) cho toàn bộ quá trình kiểm thử của bài đó.
+  - Mã nguồn (Java 17 / Python 3) được biên dịch 1 lần (nếu là Java) bên trong container, sau đó lặp qua các file testcase input trong thư mục mounted.
+  - **Chính sách Fail-Fast:** Container kết thúc và giải phóng tài nguyên ngay khi gặp testcase đầu tiên bị sai kết quả hoặc quá thời gian CPU (TLE), tránh lãng phí thời gian chạy các testcase còn lại.
 
 #### 2. Chống Thundering Herd: Exponential Backoff & Dynamic Polling:
 - Phía Client không poll cứng mỗi 1.5 giây. Thay vào đó, áp dụng thuật toán **Adaptive Polling kèm Jitter**:
@@ -158,8 +167,8 @@ sequenceDiagram
 
 #### 3. Quản lý Testcase Lớn (Tránh tràn RAM MySQL & Backend Heap):
 - Cột trong MySQL chỉ lưu Metadata: `id`, `problem_id`, `input_file_uri`, `output_file_uri`, `is_hidden`, `byte_size`.
-- Dữ liệu I/O thực tế được lưu dưới dạng file trên ổ đĩa chuyên dụng (Volume Mount hoặc MinIO/S3).
-- Khi chấm bài, Worker truyền file I/O vào Sandbox dưới dạng Stream hoặc trực tiếp mount thư mục file testcase vào container, **tuyệt đối không đọc toàn bộ chuỗi hàng chục MB vào bộ nhớ RAM của Java Backend**.
+- Dữ liệu I/O thực tế được lưu dưới dạng file trên MinIO / Object Storage.
+- Khi chấm bài, Worker tải file I/O về thư mục tạm cục bộ và mount Read-Only vào container, **tuyệt đối không đọc toàn bộ chuỗi hàng chục MB vào bộ nhớ RAM của Java Backend**.
 
 ---
 
