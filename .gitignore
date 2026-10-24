@@ -105,3 +105,4 @@ runner-tmp/
 *.tmp
 *.temp
 /docs/history/
+/.agents/
